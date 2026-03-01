@@ -1,0 +1,360 @@
+# Lydia Gillespie
+
+#This study predicts 2026 peak cherry blossom bloom dates at five international 
+#sites using a temperature-driven statistical modeling framework. Historical
+#bloom records were combined with daily meteorological observations from NOAA’s
+#Global Historical Climatology Network (GHCN). The response variable was peak
+#bloom day-of-year (DOY). Further prediction was done by comparing past winters 
+#with comparable temperatures to the current years temperatures.
+
+#Exploratory analysis showed a consistent long-term decline in bloom DOY across
+#sites since 1880, suggesting earlier flowering over time. However, simple 
+#linear time trends risk extrapolation error and do not incorporate biological
+#mechanisms. Therefore, temperature-based predictors were incorporated.
+
+#Winter temperature was selected as the primary feature due to its biological 
+#relevance to dormancy release and chilling accumulation. For each site, average
+#daily maximum temperature (TMAX) was computed for December–February winters,
+#aligning December with the subsequent bloom year. Temperatures were converted 
+#from tenths of degrees Celsius to degrees Celsius.
+
+#A multiple linear regression model was fitted with bloom DOY as the response 
+#and location, year, and average winter TMAX as predictors. This allowed 
+#separation of long-term trends from interannual climatic variability. 
+#Predictions were generated using both projected 2026 winter temperatures 
+#(based on site-specific temperature trends) and observed winter temperatures to date.
+
+#To reduce dependence on parametric assumptions, an analogue-based forecasting 
+#approach was also implemented. For each site, the five historical winters with
+#average temperatures most similar to winter 2026 (observed to date) were
+#identified. The corresponding bloom DOYs were averaged to produce a 
+#nonparametric prediction. This analogue method provides robustness against
+#model misspecification and offers interpretable uncertainty based on historical 
+#variability.
+
+#Across all sites, warmer winters were associated with earlier bloom dates. 
+#The analogue and regression-based forecasts were broadly consistent, suggesting
+#that winter temperature captures a meaningful component of bloom timing variability.
+
+#This framework balances mechanistic interpretability with statistical rigor.
+#By incorporating both parametric regression and historical analogues, 
+#it provides transparent, climate-informed forecasts while remaining computationally
+#simple and reproducible."
+
+
+
+kyoto= read.csv("C:/Users/gille/OneDrive/Desktop/stat 490/peak-bloom-prediction/data/kyoto.csv")
+liestal= read.csv("C:/Users/gille/OneDrive/Desktop/stat 490/peak-bloom-prediction/data/liestal.csv")
+washingtondc= read.csv("C:/Users/gille/OneDrive/Desktop/stat 490/peak-bloom-prediction/data/washingtondc.csv")
+vancouver= read.csv("C:/Users/gille/OneDrive/Desktop/stat 490/peak-bloom-prediction/data/vancouver.csv", comment.char="#")
+nyc= read.csv("C:/Users/gille/OneDrive/Desktop/stat 490/peak-bloom-prediction/data/nyc.csv")
+
+
+install.packages('tidyverse')
+library(tidyverse)
+
+install.packages("nlme")  # if not installed
+library(nlme)
+library(dplyr)
+library(lubridate)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+
+#Kyoto, Liestal, Washington, Vancouver, NYC
+#The six columns in each data file are
+
+# _location_ a human-readable location identifier (`string`).
+# _lat_ (approximate) latitude of the cherry trees (`double`).
+# _long_ (approximate) longitude of the cherry trees (`double`).
+# _alt_ (approximate) altitude of the cherry trees (`double`).
+# _year_ year of the observation (`integer`).
+# *bloom_date* date of peak bloom of the cherry trees (ISO 8601 date `string`). The "peak bloom date" may be defined differently for different sites
+# *bloom_doy* days since January 1st of the year until peak bloom (`integer`). January 1st corresponds to `1`.
+
+cherry= (kyoto) |> 
+  bind_rows (liestal) |> 
+  bind_rows(vancouver) |> 
+  bind_rows(nyc) |>  
+  bind_rows(washingtondc)
+
+#time series
+cherry |> 
+  filter(year >= 1880) |>
+  ggplot(aes(x = year, y = bloom_doy)) +
+  geom_point() +
+  geom_step(linetype = 'dotted', color = 'gray50') +
+  scale_x_continuous(breaks = seq(1880, 2020, by = 20)) +
+  facet_grid(cols = vars(str_to_title(location))) +
+  labs(x = "Year", y = "Peak bloom (days since Jan 1st)")
+
+
+# Fit simple least-squares lines for all sites (except nyc)
+cherry_no_nyc= cherry |> 
+  filter(location != 'newyorkcity')
+ls_fit= lm(bloom_doy ~ 0 + location + location : year, 
+             data = cherry_no_nyc, subset = year >= 1880)
+
+#90% prediction intervals from simple linear regression models
+cherry_no_nyc_grid= expand_grid(location = unique(cherry_no_nyc$location),
+                                  year = 1880:2026)
+predictions= cherry_no_nyc_grid |> 
+  bind_cols(predict(ls_fit, newdata = cherry_no_nyc_grid, 
+                    interval = 'prediction', level = 0.9)) |> 
+  rename(prediction = fit, lower = lwr, upper = upr)
+
+# Plot the predictions alongside the actual observations for 2015 up to 2023.
+cherry |> 
+  right_join(predictions, by = c('year', 'location')) |>
+  filter((location == 'vancouver' & year >= 2024) |
+           (location != 'vancouver' & year >= 2015)) |>
+  ggplot(aes(x = year, y = prediction, ymin = lower, ymax = upper)) +
+  geom_line(linewidth = 1) +
+  geom_ribbon(color = 'black', linetype = '22', linewidth = 0.8, fill = NA) +
+  geom_point(aes(y = bloom_doy)) +
+  scale_x_continuous(breaks = c(2015, 2018, 2021, 2024)) +
+  facet_grid(cols = vars(str_to_title(location))) +
+  labs(x = "Year", y = "Peak bloom (days since Jan 1st)")
+
+doy_to_date= function (year, doy) {
+  strptime(paste(year, doy, sep = '-'), '%Y-%j') |> # create date object
+    strftime('%Y-%m-%d') # translate back to date string in ISO 8601 format
+}
+
+predictions |> 
+  filter(year == 2026) |> 
+  mutate(prediction = strptime(paste(year, prediction), "%Y %j") |> 
+           as_date())
+#these predictions are based on the past dates only
+
+
+#TAVG, TMIN, TMAX, PRCP
+#Average temperature
+#precipitation in celcius x10
+
+get_ghcn_station= function(station_id, destdir = tempdir()) {
+  base_url= "https://www.ncei.noaa.gov/pub/data/ghcn/daily/by_station/"
+    file_name= paste0(station_id, ".csv.gz")
+    url= paste0(base_url, file_name)
+    destfile= file.path(destdir, file_name)
+    if (!file.exists(destfile)) {
+      download.file(url, destfile, mode = "wb")
+    }
+    data=read.csv(destfile, header = FALSE)
+    data=data[, -c(5:8)]
+    data$Date=as.Date(as.character(data$V2), "%Y%m%d")
+    data$Year=as.integer(format(data$Date, "%Y"))
+    
+    #Pivot to get vars as columns
+    data_wide=data %>%
+      select(Date, Year, V3, V4) %>%
+      pivot_wider(
+        names_from = V3,
+        values_from = V4)
+    
+    # Calculate TAVG if TMAX and TMIN exist
+    if (all(c("TMAX", "TMIN") %in% colnames(data_wide))) {
+      data_wide= data_wide %>%
+        mutate(TAVG = (TMAX + TMIN)/2)
+    }
+    
+    # Keep only the desired elements
+    elements_to_keep= c("TMIN", "TMAX", "TAVG", "PRCP")
+    data_wide= data_wide %>%
+      select(Date, Year, any_of(elements_to_keep))
+    
+    # Remove rows without both TMIN and TMAX
+    data_wide= data_wide %>%
+      filter(!is.na(TMIN) & !is.na(TMAX))
+    
+    return(data_wide)
+}
+
+kyototemp=get_ghcn_station("JA000047759")
+washdc=get_ghcn_station("USW00013743")
+vancouvertemp=get_ghcn_station("CA001108395")
+newyorkcity=get_ghcn_station("USW00014732")
+liestaltemp=get_ghcn_station("SZ000001940")
+
+
+#Temperature
+historic_temperatures= bind_rows(
+  kyototemp      |> mutate(location = "kyoto"),
+  washdc         |> mutate(location = "washingtondc"),
+  vancouvertemp  |> mutate(location = "vancouver"),
+  newyorkcity    |> mutate(location = "newyorkcity"),
+  liestaltemp    |> mutate(location = "liestal"))
+
+historic_temperatures= historic_temperatures |>
+  mutate(
+    TMAX = TMAX / 10,
+    TMIN = TMIN / 10,
+    TAVG = TAVG / 10)
+
+#December-February
+avg_winter_temp= historic_temperatures |>
+  mutate(
+    year = case_when(
+      month(Date) < 3  ~ year(Date),
+      month(Date) == 12 ~ year(Date) + 1,
+      TRUE ~ NA_integer_
+    )
+  ) |>
+  filter(!is.na(year), year >= 1970) |>
+  filter(month(Date) %in% c(12, 1, 2)) |>
+  group_by(location, year) |>
+  summarize(
+    avg_tmax = mean(TMAX, na.rm = TRUE),
+    .groups = "drop")
+
+avg_winter_temp |>
+  ggplot(aes(x = year, y = avg_tmax)) +
+  geom_line() +
+  facet_grid(rows = vars(location)) +
+  labs(y = "Average Winter Tmax (°C)")
+
+ls_fit_with_temp=cherry |>
+  inner_join(avg_winter_temp,
+             by = c("location", "year")) |>
+  lm(bloom_doy ~ location + year + avg_tmax,
+     data = _)
+
+cherry_grid= expand_grid(
+  location = unique(cherry$location),
+  year = 1990:2025
+) |>
+  inner_join(avg_winter_temp,
+             by = c("location", "year"))
+
+predictions_from_temp= cherry_grid |>
+  mutate(
+    pred_bloom = predict(ls_fit_with_temp, newdata = cherry_grid),
+    pred_date = as.Date(pred_bloom - 1,
+                        origin = paste0(year, "-01-01")))
+
+#Blue line is the predicted bloom day over the years
+#The points are the actual bloom day over the years
+predictions_from_temp |>
+  left_join(cherry,
+            by = c("location", "year")) |>
+  ggplot(aes(x = year)) +
+  geom_point(aes(y = bloom_doy)) +
+  geom_line(aes(y = pred_bloom), color = "blue") +
+  facet_grid(rows = vars(location)) +
+  labs(y = "Peak Bloom (Day of Year)")
+
+#Actual Predictions based on Temp
+predictions_from_temp <- cherry_grid |>
+  mutate(
+    pred_bloom = predict(ls_fit_with_temp, newdata = cherry_grid),
+    pred_bloom_round = round(pred_bloom),
+    pred_date = as.Date(pred_bloom_round - 1,
+                        origin = paste0(year, "-01-01")))
+
+predictions_from_temp |>
+  select(location, year, pred_bloom_round, pred_date) |>
+  arrange(location, year)
+
+temp_trend_model= lm(avg_tmax ~ year * location,
+                       data = avg_winter_temp)
+
+future_grid= expand_grid(
+  location = unique(cherry$location),
+  year = 2026)
+
+future_grid$avg_tmax= predict(temp_trend_model,
+                                newdata = future_grid)
+
+future_predictions= future_grid |>
+  mutate(
+    pred_bloom = predict(ls_fit_with_temp, newdata = future_grid),
+    pred_bloom_round = round(pred_bloom),
+    pred_date = as.Date(pred_bloom_round - 1,
+                        origin = paste0(year, "-01-01")))
+future_predictions
+
+#Compare this years temperature to historically similar winters
+temp_2026=future_grid$avg_tmax
+
+similar_winter_years= avg_winter_temp |>
+  filter(location %in% future_grid$location) |>
+  mutate(diff_from_2026 = abs(avg_tmax - temp_2026)) |>
+  group_by(location) |>
+  arrange(diff_from_2026) |>
+  slice_head(n = 5)  # pick the 5 closest years
+
+similar_blooms= similar_winter_years |>
+  left_join(cherry, by = c("location", "year")) |>
+  select(location, year, avg_tmax, bloom_doy, bloom_date) |>
+  arrange(location, year)
+
+similar_blooms
+
+similar_blooms |>
+  ggplot(aes(x = avg_tmax, y = bloom_doy, label = year)) +
+  geom_point() +
+  geom_text(nudge_y = 1, size = 3) +
+  facet_wrap(~ location) +
+  labs(
+    x = "Average Winter Tmax (°C)",
+    y = "Observed Peak Bloom (DOY)",
+    title = "Historical Years Most Similar to Projected 2026 Winter")
+
+#Find the actual winter data so far 2026
+winter_start= as.Date("2025-12-01")
+winter_end= Sys.Date()  # today's date
+
+kyoto_winter_2026      = kyototemp      |> filter(Date >= winter_start & Date <= winter_end) |> mutate(location = "kyoto")
+washdc_winter_2026     = washdc         |> filter(Date >= winter_start & Date <= winter_end) |> mutate(location = "washingtondc")
+vancouver_winter_2026  = vancouvertemp  |> filter(Date >= winter_start & Date <= winter_end) |> mutate(location = "vancouver")
+newyorkcity_winter_2026= newyorkcity    |> filter(Date >= winter_start & Date <= winter_end) |> mutate(location = "newyorkcity")
+liestal_winter_2026    = liestaltemp    |> filter(Date >= winter_start & Date <= winter_end) |> mutate(location = "liestal")
+
+# Combine all locations
+winter_2026_so_far= bind_rows(
+  kyoto_winter_2026,
+  washdc_winter_2026,
+  vancouver_winter_2026,
+  newyorkcity_winter_2026,
+  liestal_winter_2026)
+
+avg_winter_so_far= winter_2026_so_far |>
+  group_by(location) |>
+  summarize(
+    avg_tmax_so_far = mean(TMAX, na.rm = TRUE),
+    n_days = n(),
+    .groups = "drop")
+
+avg_winter_so_far
+
+similar_winter_years= avg_winter_temp |>
+  left_join(avg_winter_so_far, by = "location") |>
+  mutate(diff_from_2026 = abs(avg_tmax - avg_tmax_so_far)) |>
+  group_by(location) |>
+  arrange(diff_from_2026) |>
+  slice_head(n = 5)
+
+similar_blooms= similar_winter_years |>
+  left_join(cherry, by = c("location", "year")) |>
+  select(location, year, avg_tmax, bloom_doy, bloom_date) |>
+  arrange(location, year)
+
+similar_blooms
+
+predicted_bloom_2026= similar_blooms |>
+  group_by(location) |>
+  summarize(
+    pred_bloom_doy = round(mean(bloom_doy, na.rm = TRUE)),  # average DOY of top 5 analogues
+    .groups = "drop"
+  ) |>
+  mutate(
+    pred_bloom_date = doy_to_date(year = 2026, doy = pred_bloom_doy)
+  )
+
+predicted_bloom_2026
+
+#Kyote- 4/03
+#Liestal- 3/30
+#Vancouver- 3/30
+#NYC- 3/31
+#DC- 3/26
